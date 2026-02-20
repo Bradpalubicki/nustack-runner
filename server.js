@@ -8,7 +8,9 @@
  */
 
 require('dotenv').config();
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const { Pool } = require('pg');
 
@@ -17,10 +19,12 @@ app.use(express.json());
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const RUNNER_SECRET = process.env.RUNNER_SECRET ?? '';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? '';
 const PORT = process.env.PORT ?? 3001;
 const MAX_GLOBAL_CONCURRENT = 3;
+const REPOS_DIR = process.env.REPOS_DIR ?? '/repos';
 
-// Track active processes in-memory (per runner instance)
+// Track active processes in-memory
 const activeProcs = new Map(); // runId → ChildProcess
 
 // ─── Auth middleware ───
@@ -32,9 +36,37 @@ function requireSecret(req, res, next) {
   next();
 }
 
+// ─── Ensure repo is cloned and up to date ───
+function syncRepo(githubRepo, localPath, send) {
+  if (!githubRepo) {
+    // No GitHub repo configured — just verify localPath exists
+    if (!fs.existsSync(localPath)) {
+      throw new Error(`Local path does not exist: ${localPath}. Set githubRepo on the project to auto-clone.`);
+    }
+    return;
+  }
+
+  const tokenUrl = GITHUB_TOKEN
+    ? `https://${GITHUB_TOKEN}@github.com/${githubRepo}.git`
+    : `https://github.com/${githubRepo}.git`;
+
+  if (!fs.existsSync(localPath)) {
+    // Clone
+    send('text', { text: `Cloning ${githubRepo}...\n` });
+    fs.mkdirSync(path.dirname(localPath), { recursive: true });
+    execSync(`git clone "${tokenUrl}" "${localPath}"`, { stdio: 'pipe' });
+    send('text', { text: `Cloned to ${localPath}\n` });
+  } else {
+    // Pull latest
+    send('text', { text: `Pulling latest ${githubRepo}...\n` });
+    execSync(`git -C "${localPath}" pull --rebase`, { stdio: 'pipe' });
+    send('text', { text: `Up to date.\n` });
+  }
+}
+
 // ─── Health check ───
 app.get('/health', (req, res) => {
-  res.json({ ok: true, active: activeProcs.size });
+  res.json({ ok: true, active: activeProcs.size, reposDir: REPOS_DIR });
 });
 
 // ─── Status ───
@@ -50,10 +82,10 @@ app.get('/status', requireSecret, async (req, res) => {
 
 // ─── Run ───
 app.post('/run', requireSecret, async (req, res) => {
-  const { runId, projectSlug, localPath, command, prompt } = req.body;
+  const { runId, projectSlug, githubRepo, localPath: rawLocalPath, command, prompt } = req.body;
 
-  if (!runId || !localPath || !prompt) {
-    return res.status(400).json({ error: 'Missing runId, localPath, or prompt' });
+  if (!runId || !prompt) {
+    return res.status(400).json({ error: 'Missing runId or prompt' });
   }
 
   // Enforce global concurrent limit
@@ -62,6 +94,11 @@ app.post('/run', requireSecret, async (req, res) => {
       error: `Maximum of ${MAX_GLOBAL_CONCURRENT} concurrent runners reached.`
     });
   }
+
+  // Derive local path — if githubRepo is set, use REPOS_DIR/<slug>
+  const localPath = githubRepo
+    ? path.join(REPOS_DIR, projectSlug)
+    : rawLocalPath;
 
   // SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -74,6 +111,20 @@ app.post('/run', requireSecret, async (req, res) => {
   }
 
   send('start', { runId, projectSlug, command, prompt });
+
+  // Sync repo (clone or pull)
+  try {
+    syncRepo(githubRepo, localPath, send);
+  } catch (err) {
+    const msg = err.message;
+    send('error', { error: `Repo sync failed: ${msg}` });
+    await pool.query(
+      `UPDATE audit_run SET status = 'failed', output = $1, completed_at = NOW() WHERE id = $2`,
+      [msg, runId]
+    ).catch(console.error);
+    res.end();
+    return;
+  }
 
   let fullOutput = '';
 
@@ -188,5 +239,6 @@ app.post('/run', requireSecret, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`NuStack Runner listening on port ${PORT}`);
+  console.log(`Repos dir: ${REPOS_DIR}`);
   console.log(`Active procs: ${activeProcs.size}`);
 });
