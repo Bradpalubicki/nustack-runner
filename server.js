@@ -400,6 +400,153 @@ app.post('/gsc-review-queue', requireSecret, async (req, res) => {
   res.json({ processed: pending.length, errors });
 });
 
+// ─── Create Social Account (Playwright) ───
+// POST /create-social-account — Playwright flows for Twitter, TikTok, YouTube, Reddit
+app.post('/create-social-account', requireSecret, async (req, res) => {
+  const { platform, businessInfo, brandData, profileData } = req.body;
+
+  if (!platform || !businessInfo) {
+    return res.status(400).json({ error: 'Missing platform or businessInfo' });
+  }
+
+  const { chromium } = require('playwright');
+  const screenshots = [];
+
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+    const page = await context.newPage();
+
+    // Capture screenshot helper
+    async function snap(label) {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 60 });
+      screenshots.push({ label, data: buf.toString('base64') });
+    }
+
+    const bio = profileData?.bio ?? `${businessInfo.name} — ${businessInfo.category}`;
+    const displayName = profileData?.displayName ?? businessInfo.name;
+    const email = businessInfo.email ?? `${businessInfo.name.toLowerCase().replace(/\s+/g, '')}@gmail.com`;
+
+    // Derive a safe username
+    const baseUsername = businessInfo.name
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '')
+      .slice(0, 15) || 'business';
+
+    if (platform === 'twitter') {
+      // Twitter/X signup flow
+      await page.goto('https://twitter.com/i/flow/signup');
+      await page.waitForSelector('input[name="name"]', { timeout: 10000 }).catch(() => null);
+      await snap('twitter-signup-start');
+
+      const nameInput = page.locator('input[name="name"]').first();
+      if (await nameInput.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await nameInput.fill(displayName);
+      }
+      // Email field
+      const emailInput = page.locator('input[name="email"]').first();
+      if (await emailInput.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await emailInput.fill(email);
+      }
+      await snap('twitter-signup-filled');
+      // Note: Cannot complete without OTP verification
+      res.json({
+        success: false,
+        platform,
+        error: 'Twitter requires email OTP verification — account creation must be completed manually',
+        screenshots,
+        partialProgress: true,
+      });
+
+    } else if (platform === 'reddit') {
+      await page.goto('https://www.reddit.com/register/');
+      await page.waitForSelector('input[name="email"]', { timeout: 10000 }).catch(() => null);
+      await snap('reddit-signup-start');
+
+      const emailInput = page.locator('input[name="email"]').first();
+      if (await emailInput.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await emailInput.fill(email);
+      }
+      await snap('reddit-signup-email');
+      res.json({
+        success: false,
+        platform,
+        error: 'Reddit requires email verification — account creation must be completed manually',
+        screenshots,
+        partialProgress: true,
+      });
+
+    } else if (platform === 'tiktok') {
+      await page.goto('https://www.tiktok.com/signup/phone-or-email/email');
+      await page.waitForTimeout(3000);
+      await snap('tiktok-signup');
+      res.json({
+        success: false,
+        platform,
+        error: 'TikTok requires OTP verification — account creation must be completed manually',
+        screenshots,
+        partialProgress: true,
+      });
+
+    } else if (platform === 'youtube') {
+      // YouTube channel creation requires Google account — use automation account
+      const googleEmail = process.env.GOOGLE_AUTOMATION_EMAIL;
+      const googlePassword = process.env.GOOGLE_AUTOMATION_PASSWORD;
+      if (!googleEmail || !googlePassword) {
+        return res.json({
+          success: false,
+          platform,
+          error: 'GOOGLE_AUTOMATION_EMAIL/PASSWORD not set',
+          screenshots,
+        });
+      }
+      await page.goto('https://accounts.google.com/signin');
+      await page.waitForSelector('input[type="email"]', { timeout: 10000 });
+      await page.fill('input[type="email"]', googleEmail);
+      await page.click('#identifierNext');
+      await page.waitForSelector('input[type="password"]:not([aria-hidden="true"])', { timeout: 10000 });
+      await page.fill('input[type="password"]:not([aria-hidden="true"])', googlePassword);
+      await page.click('#passwordNext');
+      await page.waitForTimeout(3000);
+      await snap('youtube-google-logged-in');
+      await page.goto('https://www.youtube.com/create_channel');
+      await page.waitForTimeout(3000);
+      await snap('youtube-create-channel');
+
+      const channelName = page.locator('input[placeholder*="channel"], input[aria-label*="channel"], #create-channel-name').first();
+      if (await channelName.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await channelName.fill(displayName);
+        const createBtn = page.locator('button:has-text("Create"), paper-button:has-text("Create")').first();
+        if (await createBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await createBtn.click();
+          await page.waitForTimeout(3000);
+          await snap('youtube-channel-created');
+          res.json({ success: true, platform, username: displayName, screenshots });
+          return;
+        }
+      }
+      res.json({
+        success: false,
+        platform,
+        error: 'Could not locate channel name input',
+        screenshots,
+      });
+
+    } else {
+      res.json({ success: false, platform, error: `Platform ${platform} not supported for auto-creation`, screenshots });
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.json({ success: false, platform, error: msg, screenshots });
+  } finally {
+    if (browser) await browser.close().catch(() => null);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`NuStack Runner listening on port ${PORT}`);
   console.log(`Repos dir: ${REPOS_DIR}`);
