@@ -317,6 +317,88 @@ app.post('/sync-template', requireSecret, async (req, res) => {
   }
 });
 
+// ─── GSC Review Queue (Playwright) ───
+app.post('/gsc-review-queue', requireSecret, async (req, res) => {
+  const email = process.env.GOOGLE_AUTOMATION_EMAIL;
+  const password = process.env.GOOGLE_AUTOMATION_PASSWORD;
+
+  if (!email || !password) {
+    return res.status(503).json({ error: 'GOOGLE_AUTOMATION_EMAIL / GOOGLE_AUTOMATION_PASSWORD not set' });
+  }
+
+  const { rows: pending } = await pool.query(
+    `SELECT * FROM gsc_review_queue WHERE status = 'pending' ORDER BY created_at LIMIT 10`
+  );
+
+  if (pending.length === 0) {
+    return res.json({ processed: 0, errors: [] });
+  }
+
+  const { chromium } = require('playwright');
+  const errors = [];
+
+  for (const job of pending) {
+    await pool.query(`UPDATE gsc_review_queue SET status = 'submitting' WHERE id = $1`, [job.id]);
+
+    const browser = await chromium.launch({ headless: true }).catch(e => ({ _err: e.message }));
+    if (browser._err) {
+      await pool.query(`UPDATE gsc_review_queue SET status = 'failed', error = $1 WHERE id = $2`, [browser._err, job.id]);
+      errors.push(`job ${job.id}: ${browser._err}`);
+      continue;
+    }
+
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+    });
+    const page = await context.newPage();
+
+    try {
+      await page.goto('https://accounts.google.com/signin');
+      await page.waitForSelector('input[type="email"]', { timeout: 10000 });
+      await page.fill('input[type="email"]', email);
+      await page.click('#identifierNext');
+      await page.waitForSelector('input[type="password"]', { timeout: 10000 });
+      await page.fill('input[type="password"]', password);
+      await page.click('#passwordNext');
+      await page.waitForNavigation({ timeout: 15000 });
+
+      const encodedProperty = encodeURIComponent(job.property_url);
+      await page.goto(
+        `https://search.google.com/search-console/security-issues?resource_id=${encodedProperty}`,
+        { waitUntil: 'networkidle', timeout: 20000 }
+      );
+
+      const reviewBtn = page.getByText('Request a review', { exact: false }).first();
+      const visible = await reviewBtn.isVisible({ timeout: 5000 }).catch(() => false);
+      if (visible) {
+        await reviewBtn.click({ timeout: 5000 });
+        const textarea = page.locator('textarea').first();
+        if (await textarea.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await textarea.fill(job.description);
+        }
+        const submitBtn = page.locator('button:has-text("Submit"), button:has-text("Send")').first();
+        if (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await submitBtn.click();
+          await page.waitForTimeout(2000);
+        }
+      }
+
+      await pool.query(
+        `UPDATE gsc_review_queue SET status = 'submitted', submitted_at = NOW(), result = $1 WHERE id = $2`,
+        ['Review submitted via Playwright automation', job.id]
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await pool.query(`UPDATE gsc_review_queue SET status = 'failed', error = $1 WHERE id = $2`, [msg, job.id]);
+      errors.push(`job ${job.id}: ${msg}`);
+    } finally {
+      await browser.close();
+    }
+  }
+
+  res.json({ processed: pending.length, errors });
+});
+
 app.listen(PORT, () => {
   console.log(`NuStack Runner listening on port ${PORT}`);
   console.log(`Repos dir: ${REPOS_DIR}`);
