@@ -237,6 +237,86 @@ app.post('/run', requireSecret, async (req, res) => {
   });
 });
 
+// ─── Sync Template ───
+// Merges latest changes from templateRepo into the project's default branch and opens a PR.
+app.post('/sync-template', requireSecret, async (req, res) => {
+  const { projectSlug, githubRepo, localPath: rawLocalPath, templateRepo } = req.body;
+
+  if (!projectSlug || !githubRepo) {
+    return res.status(400).json({ error: 'Missing projectSlug or githubRepo' });
+  }
+
+  const localPath = path.join(REPOS_DIR, projectSlug);
+  const template = templateRepo ?? 'Bradpalubicki/dental-engine';
+  const tokenUrl = GITHUB_TOKEN
+    ? `https://${GITHUB_TOKEN}@github.com/${githubRepo}.git`
+    : `https://github.com/${githubRepo}.git`;
+
+  try {
+    // Ensure repo is cloned
+    if (!fs.existsSync(localPath)) {
+      execSync(`git clone "${tokenUrl}" "${localPath}"`, { stdio: 'pipe' });
+    } else {
+      execSync(`git -C "${localPath}" pull --rebase`, { stdio: 'pipe' });
+    }
+
+    const branchName = `template-sync-${Date.now()}`;
+
+    // Add template remote if not present
+    try {
+      execSync(`git -C "${localPath}" remote add template "https://github.com/${template}.git"`, { stdio: 'pipe' });
+    } catch {
+      // already exists — ok
+    }
+
+    execSync(`git -C "${localPath}" fetch template main`, { stdio: 'pipe' });
+    execSync(`git -C "${localPath}" checkout -b "${branchName}"`, { stdio: 'pipe' });
+
+    // Merge template changes, keep ours on conflict
+    execSync(`git -C "${localPath}" merge template/main --no-commit --no-ff -X ours`, { stdio: 'pipe' });
+
+    // Commit if anything changed
+    const statusOut = execSync(`git -C "${localPath}" status --porcelain`, { encoding: 'utf8' });
+    if (statusOut.trim()) {
+      execSync(`git -C "${localPath}" commit -m "chore: sync from ${template}"`, { stdio: 'pipe' });
+    }
+
+    // Push branch
+    execSync(`git -C "${localPath}" push origin "${branchName}"`, { stdio: 'pipe' });
+
+    // Create PR via GitHub API
+    let prUrl = null;
+    if (GITHUB_TOKEN) {
+      const [owner, repo] = githubRepo.split('/');
+      const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+        method: 'POST',
+        headers: {
+          Authorization: `token ${GITHUB_TOKEN}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'nustack-runner',
+        },
+        body: JSON.stringify({
+          title: `chore: sync template from ${template}`,
+          head: branchName,
+          base: 'main',
+          body: `Auto-generated template sync from \`${template}\`.\n\nConflicts resolved with project-side wins (ours strategy).`,
+        }),
+      });
+      if (prRes.ok) {
+        const prData = await prRes.json();
+        prUrl = prData.html_url;
+      }
+    }
+
+    // Checkout back to main
+    execSync(`git -C "${localPath}" checkout main`, { stdio: 'pipe' });
+
+    res.json({ ok: true, branch: branchName, prUrl, message: prUrl ? `PR opened: ${prUrl}` : 'Branch pushed (no GITHUB_TOKEN for PR)' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`NuStack Runner listening on port ${PORT}`);
   console.log(`Repos dir: ${REPOS_DIR}`);
