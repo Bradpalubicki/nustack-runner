@@ -357,8 +357,9 @@ app.post('/gsc-review-queue', requireSecret, async (req, res) => {
       await page.waitForSelector('input[type="email"]', { timeout: 10000 });
       await page.fill('input[type="email"]', email);
       await page.click('#identifierNext');
-      await page.waitForSelector('input[type="password"]', { timeout: 10000 });
-      await page.fill('input[type="password"]', password);
+      // Google's visible password field (not the hidden one)
+      await page.waitForSelector('input[type="password"]:not([aria-hidden="true"])', { timeout: 10000 });
+      await page.fill('input[type="password"]:not([aria-hidden="true"])', password);
       await page.click('#passwordNext');
       await page.waitForNavigation({ timeout: 15000 });
 
